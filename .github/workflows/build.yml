@@ -7,6 +7,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   macos:
     name: macOS (VST3 + AU, Apple Silicon + Intel)
