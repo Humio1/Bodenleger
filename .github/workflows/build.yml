@@ -1,0 +1,65 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    name: macOS (VST3 + AU, Apple Silicon + Intel)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache JUCE download
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: juce-8.0.9-${{ runner.os }}-v1
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+
+      - name: Engine test
+        run: |
+          cmake --build build --target EngineTest -j 4
+          cd build && ./EngineTest
+
+      - name: Build plugin
+        run: cmake --build build --target Bodenleger_VST3 Bodenleger_AU -j 4
+
+      - name: Sign (ad hoc)
+        run: |
+          codesign --force --deep --sign - build/Bodenleger_artefacts/Release/VST3/Bodenleger.vst3
+          codesign --force --deep --sign - build/Bodenleger_artefacts/Release/AU/Bodenleger.component
+
+      - name: Package
+        run: |
+          mkdir -p dist/Bodenleger
+          cp -R build/Bodenleger_artefacts/Release/VST3/Bodenleger.vst3 dist/Bodenleger/
+          cp -R build/Bodenleger_artefacts/Release/AU/Bodenleger.component dist/Bodenleger/
+          cp scripts/Install\ Bodenleger.command dist/Bodenleger/
+          chmod +x "dist/Bodenleger/Install Bodenleger.command"
+          cp INSTALL.md dist/Bodenleger/
+          cd dist && ditto -c -k --keepParent Bodenleger ../Bodenleger-macOS.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Bodenleger-macOS
+          path: Bodenleger-macOS.zip
+
+      - name: Validate with pluginval
+        run: |
+          curl -sSL -o pluginval.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip
+          unzip -q pluginval.zip
+          pluginval.app/Contents/MacOS/pluginval --strictness-level 5 --skip-gui-tests --validate-in-process \
+            --validate build/Bodenleger_artefacts/Release/VST3/Bodenleger.vst3
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Bodenleger-macOS.zip
