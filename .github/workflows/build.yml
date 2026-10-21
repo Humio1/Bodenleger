@@ -61,8 +61,19 @@ jobs:
           pluginval.app/Contents/MacOS/pluginval --strictness-level 5 --skip-gui-tests --validate-in-process \
             --validate build/Bodenleger_artefacts/Release/VST3/Bodenleger.vst3
 
+      - name: Read version
+        id: version
+        run: echo "version=$(sed -n 's/^project(Bodenleger VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)" >> "$GITHUB_OUTPUT"
+
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Bodenleger ${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            Download **Bodenleger-macOS.zip** below, unzip it and double-click **Install Bodenleger.command**.
+            Built from ${{ github.sha }}.
           files: Bodenleger-macOS.zip
+          overwrite_files: true
