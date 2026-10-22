@@ -85,10 +85,11 @@ static const char* keyName (Key k)
 
 static int failures = 0;
 
-static void render (Engine& e, const Buf* input, double seconds, const EngineParams& p, std::vector<float>& outL, std::vector<float>& outR)
+static void render (Engine& e, const Buf* input, double seconds, EngineParams p, std::vector<float>& outL, std::vector<float>& outR,
+                    const Buf* sidechain = nullptr, float* maxDuck = nullptr)
 {
     const int block = 512, total = (int) (seconds * SR);
-    std::vector<float> il (block), ir (block), ol (block), orr (block);
+    std::vector<float> il (block), ir (block), ol (block), orr (block), sl (block), sr (block);
     for (int pos = 0; pos < total; pos += block)
     {
         const int n = std::min (block, total - pos);
@@ -96,8 +97,13 @@ static void render (Engine& e, const Buf* input, double seconds, const EnginePar
         {
             il[(size_t) i] = input ? input->L[(size_t) ((pos + i) % (int) input->L.size())] : 0.0f;
             ir[(size_t) i] = input ? input->R[(size_t) ((pos + i) % (int) input->R.size())] : 0.0f;
+            sl[(size_t) i] = sidechain ? sidechain->L[(size_t) ((pos + i) % (int) sidechain->L.size())] : 0.0f;
+            sr[(size_t) i] = sidechain ? sidechain->R[(size_t) ((pos + i) % (int) sidechain->R.size())] : 0.0f;
         }
+        if (sidechain) { p.sidechainL = sl.data(); p.sidechainR = sr.data(); }
+        p.lfoPhase = -1.0;
         e.process (il.data(), ir.data(), ol.data(), orr.data(), n, p);
+        if (maxDuck) *maxDuck = std::max (*maxDuck, e.duckAmount.load());
         outL.insert (outL.end(), ol.begin(), ol.begin() + n);
         outR.insert (outR.end(), orr.begin(), orr.begin() + n);
         while (auto* r = e.takeRetired()) delete r;
@@ -119,6 +125,42 @@ static void check (const char* label, const std::vector<float>& L, const std::ve
     if (! ok) ++failures;
 }
 
+static Buf kicks()
+{
+    return makeBuf (8, [] (auto& L, auto& R, int n)
+    {
+        for (double hit = 0; hit < 8; hit += 0.5)
+        {
+            double ph = 0;
+            for (int i = 0; i < (int) (SR * 0.3) && (int) (hit * SR) + i < n; ++i)
+            {
+                const double t = i / SR; ph += 2 * M_PI * (50 + 120 * std::exp (-t * 30)) / SR;
+                const float v = (float) (std::sin (ph) * std::exp (-t * 9) * 0.8);
+                L[(size_t) (hit * SR) + (size_t) i] += v; R[(size_t) (hit * SR) + (size_t) i] += v;
+            }
+        }
+    });
+}
+
+/** Ratio between the loudest and quietest 50 ms window (in dB) after skip. */
+static double swingDb (const std::vector<float>& L, size_t skip)
+{
+    const size_t w = (size_t) (0.05 * SR);
+    double lo = 1e9, hi = 0;
+    for (size_t a = skip; a + w < L.size(); a += w)
+    {
+        double e = 0; for (size_t i = a; i < a + w; ++i) e += L[i] * L[i];
+        e = std::sqrt (e / w); lo = std::min (lo, e); hi = std::max (hi, e);
+    }
+    return hi <= 0 ? -1.0 : 20 * std::log10 (hi / std::max (lo, 1e-9));
+}
+
+static void expect (const char* label, bool ok, double value)
+{
+    std::printf ("%-28s %8.2f    %s\n", label, value, ok ? "OK" : "FAIL");
+    if (! ok) ++failures;
+}
+
 int main()
 {
     const Buf ch = chords(), sn = snare();
@@ -132,7 +174,7 @@ int main()
     {
         Engine e; e.prepare (SR, 512);
         std::vector<SourceSpectra> src { { chordData->spectra, 0.8f, 0.6f }, { snareData->spectra, 0.8f, 0.4f } };
-        auto r = builder.build (src, { { chordData, 0.8f }, { snareData, 0.8f } }, true, {}, SR);
+        auto r = builder.build (src, { { chordData, 0.8f }, { snareData, 0.8f } }, true, {}, 0, SR);
         std::printf ("Samples: detected key %s\n", keyName (r.key));
         if (r.set == nullptr) { std::printf ("build failed\n"); return 1; }
         delete e.submit (r.set);
@@ -159,7 +201,7 @@ int main()
         for (int k = 0; k < 3; ++k) s.spectra[(size_t) k] = spectrumOf (recent.data() + k * win, win);
         normaliseSet (s.spectra);
         s.level = 1.0f; s.tone = 0.6f;
-        auto r = builder.build ({ s }, {}, true, {}, SR);
+        auto r = builder.build ({ s }, {}, true, {}, 0, SR);
         std::printf ("Return: detected key %s\n", keyName (r.key));
         if (r.set == nullptr) { std::printf ("build failed\n"); return 1; }
         delete e.submit (r.set);
@@ -167,6 +209,83 @@ int main()
         render (e, &track, 10, p, L, R);
         check (mode ? "return / wash" : "return / drone", L, R, (size_t) (11 * SR));
         writeWav (mode ? "return_wash.wav" : "return_drone.wav", L, R);
+    }
+
+    // --- in-key modes and noise modes
+    std::vector<SourceSpectra> src { { chordData->spectra, 0.8f, 0.6f }, { snareData->spectra, 0.8f, 0.4f } };
+    const char* keyLabels[] = { "key mode scale", "key mode chord", "key mode shimmer" };
+    const char* noiseLabels[] = { "noise mode air", "noise mode dust", "noise mode wind" };
+    for (int km = 0; km < 3; ++km)
+    {
+        Engine e; e.prepare (SR, 512);
+        auto r = builder.build (src, {}, true, {}, km, SR);
+        delete e.submit (r.set);
+        EngineParams p; p.source = 1; p.key = r.key; p.tonal = 1.0f; p.noise = 0.0f;
+        std::vector<float> L, R;
+        render (e, nullptr, 6, p, L, R);
+        check (keyLabels[km], L, R, (size_t) (3 * SR));
+    }
+    for (int nm = 0; nm < 3; ++nm)
+    {
+        Engine e; e.prepare (SR, 512);
+        auto r = builder.build (src, {}, true, {}, 0, SR);
+        delete e.submit (r.set);
+        EngineParams p; p.source = 1; p.key = r.key; p.tonal = 0.0f; p.noise = 1.0f; p.noiseMode = nm;
+        std::vector<float> L, R;
+        render (e, nullptr, 6, p, L, R);
+        check (noiseLabels[nm], L, R, (size_t) (3 * SR));
+        if (nm == 1) writeWav ("noise_dust.wav", L, R);
+        if (nm == 2) writeWav ("noise_wind.wav", L, R);
+    }
+
+    // --- Breath: from the input and from an external sidechain
+    const Buf kick = kicks();
+    const char* breathLabels[] = { "breath smooth swing dB", "breath pump swing dB", "breath gate swing dB" };
+    for (int bm = 0; bm < 3; ++bm)
+    {
+        Engine e; e.prepare (SR, 512);
+        auto r = builder.build (src, {}, true, {}, 0, SR);
+        delete e.submit (r.set);
+        EngineParams p; p.source = 1; p.key = r.key; p.breath = 1.0f; p.breathMode = bm; p.mix = 1.0f; p.drift = 0.0f;
+        std::vector<float> L, R; float md = 0;
+        render (e, nullptr, 6, p, L, R, &kick, &md);
+        const double sw = swingDb (L, (size_t) (3 * SR));
+        expect (breathLabels[bm], sw > (bm == 0 ? 6.0 : 12.0) && md > 0.9f, sw);
+        if (bm == 1) writeWav ("breath_pump_sidechain.wav", L, R);
+    }
+    {
+        Engine e; e.prepare (SR, 512);
+        auto r = builder.build (src, {}, true, {}, 0, SR);
+        delete e.submit (r.set);
+        EngineParams p; p.source = 1; p.key = r.key; p.breath = 1.0f; p.breathMode = 1; p.mix = 1.0f; p.drift = 0.0f;
+        std::vector<float> L, R; float md = 0;
+        Buf quiet = kick; for (auto& v : quiet.L) v *= 0.1f; for (auto& v : quiet.R) v *= 0.1f; // -20 dB send
+        render (e, &quiet, 6, p, L, R, nullptr, &md);
+        expect ("breath pump at -20 dB input", md > 0.8f, md);
+    }
+
+    // --- LFO on level, synced square at 2 Hz
+    {
+        Engine e; e.prepare (SR, 512);
+        auto r = builder.build (src, {}, true, {}, 0, SR);
+        delete e.submit (r.set);
+        EngineParams p; p.source = 1; p.key = r.key; p.drift = 0.0f; p.breath = 0.0f;
+        p.lfoShape = 2; p.lfoHz = 2.0; p.lfoDepth = 1.0f; p.lfoTargets = kModLevel | kModPan;
+        std::vector<float> L, R;
+        render (e, nullptr, 6, p, L, R);
+        const double sw = swingDb (L, (size_t) (3 * SR));
+        expect ("lfo level+pan swing dB", sw > 20.0, sw);
+        check ("lfo output", L, R, (size_t) (3 * SR));
+        for (int shape = 0; shape < 4; ++shape)
+        {
+            Engine e2; e2.prepare (SR, 512);
+            delete e2.submit (builder.build (src, {}, true, {}, 0, SR).set);
+            EngineParams q = p; q.lfoShape = shape; q.lfoTargets = kModColor | kModTonal | kModNoise; q.lfoHz = 5.0;
+            std::vector<float> L2, R2;
+            render (e2, nullptr, 4, q, L2, R2);
+            check (shape == 0 ? "lfo sine filter" : shape == 1 ? "lfo triangle filter" : shape == 2 ? "lfo square filter" : "lfo random filter",
+                   L2, R2, (size_t) (2 * SR));
+        }
     }
 
     std::printf (failures ? "\n%d check(s) FAILED\n" : "\nAll checks passed\n", failures);

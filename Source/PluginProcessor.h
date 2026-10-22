@@ -19,6 +19,20 @@ inline constexpr const char* breath    = "breath";
 inline constexpr const char* mix       = "mix";
 inline constexpr const char* returnAir = "returnAir";
 inline constexpr const char* follow    = "follow";
+inline constexpr const char* keyMode     = "keyMode";
+inline constexpr const char* noiseMode   = "noiseMode";
+inline constexpr const char* breathMode  = "breathMode";
+inline constexpr const char* breathListen = "breathListen";
+inline constexpr const char* lfoShape    = "lfoShape";
+inline constexpr const char* lfoSync     = "lfoSync";
+inline constexpr const char* lfoRate     = "lfoRate";
+inline constexpr const char* lfoDivision = "lfoDivision";
+inline constexpr const char* lfoDepth    = "lfoDepth";
+inline constexpr const char* modColor    = "modColor";
+inline constexpr const char* modTonal    = "modTonal";
+inline constexpr const char* modNoise    = "modNoise";
+inline constexpr const char* modLevel    = "modLevel";
+inline constexpr const char* modPan      = "modPan";
 inline juce::String slotLevel (int i) { return "slot" + juce::String (i + 1) + "Level"; }
 inline juce::String slotAir (int i)   { return "slot" + juce::String (i + 1) + "Air"; }
 } // namespace ids
@@ -78,6 +92,10 @@ public:
     bool isBuilding() const { return building.load(); }
     int getSourceMode() const { return (int) apvts.getRawParameterValue (ids::source)->load(); }
     bool isAudioRunning() const;
+    int getKeyMode() const { return (int) apvts.getRawParameterValue (ids::keyMode)->load(); }
+    /** True while the host feeds the sidechain input with something audible. */
+    bool isSidechainActive() const { return juce::Time::getMillisecondCounter() - lastSidechainTime.load() < 600; }
+    float getLfoDepthFor (const char* targetId) const;
 
 private:
     class BuildThread;
@@ -103,6 +121,8 @@ private:
     std::atomic<juce::uint32> requestTime { 0 }, lastBuildTime { 0 }, lastAudioTime { 0 };
     std::atomic<int> detectedRoot { 9 }, detectedScale { 0 };
     std::atomic<double> hostRate { 48000.0 };
+    std::atomic<juce::uint32> lastSidechainTime { 0 };
+    juce::AudioBuffer<float> sidechainCopy;
     std::shared_ptr<std::atomic<bool>> alive = std::make_shared<std::atomic<bool>> (true);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BodenlegerProcessor)

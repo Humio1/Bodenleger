@@ -12,7 +12,20 @@ Offergeld's idea: because the pad is made only from sounds already in the projec
   notes of the detected (or chosen) key, and resynthesised with random phases into seamless loops.
 - **Drone** plays the resynthesised layers. **Wash** adds long grains of the source through tuned resonators and a long reverb.
 
-Controls: Tonal, Noise, Drift, Color, Breath (ducks with the return input), Mix.
+Controls: Tonal, Noise, Drift, Color, Breath (sidechain depth), Mix.
+
+**Character switches**
+
+- **In key:** Scale (all scale notes), Chord (root, 3rd, 5th, 7th only), Shimmer (scale plus an octave-up copy).
+- **Noise:** Air (smooth), Dust (vinyl-like crackle), Wind (sweeping resonant bands).
+- **Breath:** Smooth follows the energy, Pump hits hard and lets go fast, Gate chops. At 100 % the pad is pulled down completely.
+- **Listen:** Breath reacts to the plugin's input, or to the **sidechain input**. In Ableton, open the device's
+  sidechain section and pick e.g. the kick track. The lamp next to *Sidechain* lights up while signal arrives.
+
+**Modulation:** one LFO (Sine, Triangle, Square, Random) with free rate or tempo sync (8 bars to 1/16),
+a depth control and switchable targets: Color, Tonal, Noise, Level, Pan. Modulated knobs show the range as a ring.
+
+The window can be resized from the bottom-right corner; the size is remembered with the project.
 
 ## Building
 

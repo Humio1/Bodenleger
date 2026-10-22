@@ -49,12 +49,13 @@ private:
 BodenlegerProcessor::BodenlegerProcessor()
     : AudioProcessor (BusesProperties()
                           .withInput ("Input", juce::AudioChannelSet::stereo(), true)
-                          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+                          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
+                          .withInput ("Sidechain", juce::AudioChannelSet::stereo(), false)),
       apvts (*this, nullptr, "Bodenleger", createLayout())
 {
     formats.registerBasicFormats();
 
-    for (auto* id : { ids::source, ids::keyAuto, ids::keyRoot, ids::keyScale, ids::returnAir })
+    for (auto* id : { ids::source, ids::keyAuto, ids::keyRoot, ids::keyScale, ids::returnAir, ids::keyMode })
         apvts.addParameterListener (id, this);
     for (int i = 0; i < kSlots; ++i)
     {
@@ -101,13 +102,34 @@ juce::AudioProcessorValueTreeState::ParameterLayout BodenlegerProcessor::createL
             const float f = 600.0f * std::pow (30.0f, v);
             return f >= 1000.0f ? String (f / 1000.0f, f >= 10000.0f ? 0 : 1) + " kHz" : String (roundToInt (f)) + " Hz";
         })));
-    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::breath, 1 }, "Breath", unit, 0.3f,
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::breath, 1 }, "Breath", unit, 0.4f,
         AudioParameterFloatAttributes().withStringFromValueFunction (pct)));
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::mix, 1 }, "Mix", unit, 1.0f,
         AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int)
         { return String (roundToInt (v * 100.0f)) + " % pad"; })));
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::returnAir, 1 }, "Return Tone/Air", unit, 0.4f));
     layout.add (std::make_unique<AudioParameterBool> (ParameterID { ids::follow, 1 }, "Follow", true));
+
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ids::keyMode, 2 }, "In Key Mode", StringArray { "Scale", "Chord", "Shimmer" }, 0));
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ids::noiseMode, 2 }, "Noise Mode", StringArray { "Air", "Dust", "Wind" }, 0));
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ids::breathMode, 2 }, "Breath Mode", StringArray { "Smooth", "Pump", "Gate" }, 1));
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ids::breathListen, 2 }, "Breath Listens To", StringArray { "Input", "Sidechain" }, 0));
+
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ids::lfoShape, 2 }, "LFO Shape", StringArray { "Sine", "Triangle", "Square", "Random" }, 0));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { ids::lfoSync, 2 }, "LFO Sync", false));
+    auto rateRange = NormalisableRange<float> (0.02f, 10.0f, 0.0f, 0.3f);
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::lfoRate, 2 }, "LFO Rate", rateRange, 0.15f,
+        AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int)
+        { return v < 1.0f ? String (v, 2) + " Hz" : String (v, 1) + " Hz"; })));
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ids::lfoDivision, 2 }, "LFO Sync Rate",
+        StringArray { "8 bars", "4 bars", "2 bars", "1 bar", "1/2", "1/4", "1/8", "1/16" }, 3));
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ids::lfoDepth, 2 }, "LFO Depth", unit, 0.3f,
+        AudioParameterFloatAttributes().withStringFromValueFunction (pct)));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { ids::modColor, 2 }, "LFO to Color", true));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { ids::modTonal, 2 }, "LFO to Tonal", false));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { ids::modNoise, 2 }, "LFO to Noise", false));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { ids::modLevel, 2 }, "LFO to Level", false));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { ids::modPan, 2 }, "LFO to Pan", false));
 
     for (int i = 0; i < kSlots; ++i)
     {
@@ -137,13 +159,20 @@ bool BodenlegerProcessor::isBusesLayoutSupported (const BusesLayout& layouts) co
     const auto out = layouts.getMainOutputChannelSet();
     const auto in  = layouts.getMainInputChannelSet();
     if (out != juce::AudioChannelSet::stereo()) return false;
-    return in == juce::AudioChannelSet::stereo() || in == juce::AudioChannelSet::mono();
+    if (in != juce::AudioChannelSet::stereo() && in != juce::AudioChannelSet::mono()) return false;
+    if (layouts.inputBuses.size() > 1)
+    {
+        const auto sc = layouts.getChannelSet (true, 1);
+        if (! sc.isDisabled() && sc != juce::AudioChannelSet::mono() && sc != juce::AudioChannelSet::stereo()) return false;
+    }
+    return true;
 }
 
 void BodenlegerProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     const double old = hostRate.exchange (sampleRate);
     engine.prepare (sampleRate, samplesPerBlock);
+    sidechainCopy.setSize (2, juce::jmax (samplesPerBlock, 512) * 2, false, true, false);
     requestBuild (true);
 
     if (std::abs (old - sampleRate) > 1.0)
@@ -180,10 +209,29 @@ void BodenlegerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     const int n = buffer.getNumSamples();
     if (n == 0 || buffer.getNumChannels() < 2) return;
 
-    if (getTotalNumInputChannels() == 1)
+    // Copy the sidechain first: with a mono main input its channels sit where the output's right channel goes.
+    bool haveSidechain = false;
+    if (getBusCount (true) > 1 && getBus (true, 1)->isEnabled() && n <= sidechainCopy.getNumSamples())
+    {
+        auto sc = getBusBuffer (buffer, true, 1);
+        if (sc.getNumChannels() > 0)
+        {
+            sidechainCopy.copyFrom (0, 0, sc, 0, 0, n);
+            sidechainCopy.copyFrom (1, 0, sc, juce::jmin (1, sc.getNumChannels() - 1), 0, n);
+            haveSidechain = true;
+            if (sidechainCopy.getMagnitude (0, n) > 0.001f)
+                lastSidechainTime = juce::Time::getMillisecondCounter();
+        }
+    }
+
+    const int mainIns = getMainBusNumInputChannels();
+    if (mainIns == 1)
         buffer.copyFrom (1, 0, buffer, 0, 0, n);
-    else if (getTotalNumInputChannels() == 0)
-        buffer.clear();
+    else if (mainIns == 0)
+    {
+        buffer.clear (0, 0, n);
+        buffer.clear (1, 0, n);
+    }
 
     bl::EngineParams p;
     p.source = (int) param (ids::source);
@@ -195,12 +243,50 @@ void BodenlegerProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     p.breath = param (ids::breath);
     p.mix    = param (ids::mix);
     p.key    = getEffectiveKey();
+    p.noiseMode  = (int) param (ids::noiseMode);
+    p.breathMode = (int) param (ids::breathMode);
+    if (haveSidechain && param (ids::breathListen) > 0.5f)
+    {
+        p.sidechainL = sidechainCopy.getReadPointer (0);
+        p.sidechainR = sidechainCopy.getReadPointer (1);
+    }
+
+    // LFO, free or locked to the host tempo
+    p.lfoShape = (int) param (ids::lfoShape);
+    p.lfoDepth = param (ids::lfoDepth);
+    p.lfoTargets = (param (ids::modColor) > 0.5f ? bl::kModColor : 0) | (param (ids::modTonal) > 0.5f ? bl::kModTonal : 0)
+                 | (param (ids::modNoise) > 0.5f ? bl::kModNoise : 0) | (param (ids::modLevel) > 0.5f ? bl::kModLevel : 0)
+                 | (param (ids::modPan) > 0.5f ? bl::kModPan : 0);
+    p.lfoHz = param (ids::lfoRate);
+    if (param (ids::lfoSync) > 0.5f)
+    {
+        static const double beatsPer[] = { 32.0, 16.0, 8.0, 4.0, 2.0, 1.0, 0.5, 0.25 };
+        const double beats = beatsPer[juce::jlimit (0, 7, (int) param (ids::lfoDivision))];
+        double bpm = 120.0;
+        if (auto* ph = getPlayHead())
+            if (auto pos = ph->getPosition())
+            {
+                if (auto b = pos->getBpm()) bpm = *b;
+                if (pos->getIsPlaying())
+                    if (auto ppq = pos->getPpqPosition())
+                    {
+                        const double cyc = *ppq / beats;
+                        p.lfoPhase = cyc - std::floor (cyc);
+                    }
+            }
+        p.lfoHz = bpm / 60.0 / beats;
+    }
 
     auto* l = buffer.getWritePointer (0);
     auto* r = buffer.getWritePointer (1);
     engine.process (l, r, l, r, n, p);
 
     lastAudioTime = juce::Time::getMillisecondCounter();
+}
+
+float BodenlegerProcessor::getLfoDepthFor (const char* targetId) const
+{
+    return param (targetId) > 0.5f ? param (ids::lfoDepth) : 0.0f;
 }
 
 bl::Key BodenlegerProcessor::getEffectiveKey() const
@@ -249,7 +335,7 @@ void BodenlegerProcessor::doBuild()
     const bl::Key manual { (int) param (ids::keyRoot), (int) param (ids::keyScale) };
 
     building = true;
-    auto result = builder.build (sources, std::move (grains), autoKey, manual, sr);
+    auto result = builder.build (sources, std::move (grains), autoKey, manual, (int) param (ids::keyMode), sr);
     building = false;
 
     if (result.set != nullptr)

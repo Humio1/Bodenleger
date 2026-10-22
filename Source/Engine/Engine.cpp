@@ -32,10 +32,17 @@ void Engine::prepare (double sampleRate, int)
 
     for (auto& s : snapGain) { s.setTime (sr, 0.2); s.snap (0.6f); }
     for (auto* s : { &layerLevel, &directLevel, &revSend, &grainLevel }) s->setTime (sr, 0.25);
-    for (auto* s : { &grainDry, &resLevel, &gRaw, &gTon, &gNoi, &colour, &dryMix, &wetMix }) s->setTime (sr, 0.06);
-    duck.setTime (sr, 0.03);
+    for (auto* s : { &grainDry, &resLevel, &gRaw, &gTon, &gNoi, &colour }) s->setTime (sr, 0.012);
+    for (auto* s : { &dryMix, &wetMix, &wAir, &wDust, &wWind }) s->setTime (sr, 0.03);
+    for (auto* s : { &panL, &panR, &levelMod }) s->setTime (sr, 0.004);
+    duck.setTime (sr, 0.0015);
     layerLevel.snap (1); directLevel.snap (1); revSend.snap (0.22f); grainLevel.snap (0);
     duck.snap (1); colour.snap (0.5f); dryMix.snap (0); wetMix.snap (1);
+    wAir.snap (1); wDust.snap (0); wWind.snap (0);
+    panL.snap (1); panR.snap (1); levelMod.snap (1);
+    for (auto& ch : windBp) for (auto& f : ch) f.reset();
+    crackle[0] = crackle[1] = 0;
+    lfoPh = 0; lfoSmooth = 0; lfoRandPrev = lfoRandNext = 0;
 
     for (auto& g : grains) g.active = false;
     for (auto& f : grainHP) { f.highpass (sr, 160.0, 0.707); f.reset(); }
@@ -43,7 +50,7 @@ void Engine::prepare (double sampleRate, int)
     for (auto* f : { &shelfLo[0], &shelfLo[1], &shelfHi[0], &shelfHi[1], &lp[0], &lp[1] }) f->reset();
     resKey = { -1, -1 };
     reverb.prepare (sr, 6.0);
-    envMs = env = 0;
+    detEnv = 0;
     filterCounter = 0;
     grainCountdown = 0;
 }
@@ -169,8 +176,20 @@ void Engine::spawnGrain (const EngineParams& p) noexcept
     grains[slot] = g;
 }
 
+float Engine::lfoShapeValue (int shape, double ph) const noexcept
+{
+    switch (shape)
+    {
+        case 1:  return (float) (1.0 - 4.0 * std::abs (ph - 0.5));           // triangle, starts low
+        case 2:  return ph < 0.5 ? 1.0f : -1.0f;                             // square
+        case 3:  return lfoRandPrev + (lfoRandNext - lfoRandPrev)            // random, glides over the first quarter
+                        * (float) std::min (1.0, ph * 4.0);
+        default: return (float) std::sin (2.0 * kPi * ph);                  // sine
+    }
+}
+
 void Engine::renderLayers (Play& pl, float fadeGain, const float* sg, float gr, float gt, float gn,
-                           float tonRate[kSnapshots], float& L, float& R) noexcept
+                           float tonRate[kSnapshots], float& L, float& R, float& NL, float& NR) noexcept
 {
     const LayerSet& s = *pl.set;
     const int len = s.length;
@@ -188,8 +207,10 @@ void Engine::renderLayers (Play& pl, float fadeGain, const float* sg, float gr, 
         const float tl = ton.left[(size_t) t0] + (ton.left[(size_t) t1] - ton.left[(size_t) t0]) * fr;
         const float tr = ton.right[(size_t) t0] + (ton.right[(size_t) t1] - ton.right[(size_t) t0]) * fr;
         const float g = sg[k] * fadeGain;
-        L += g * (gr * raw.left[(size_t) i] + gt * tl + gn * noi.left[(size_t) i]);
-        R += g * (gr * raw.right[(size_t) i] + gt * tr + gn * noi.right[(size_t) i]);
+        L += g * (gr * raw.left[(size_t) i] + gt * tl);
+        R += g * (gr * raw.right[(size_t) i] + gt * tr);
+        NL += g * gn * noi.left[(size_t) i];
+        NR += g * gn * noi.right[(size_t) i];
 
         if (++pl.pos[k] >= len) pl.pos[k] = 0;
         pl.tonPhase[k] += tonRate[k];
@@ -241,20 +262,39 @@ void Engine::process (const float* inL, const float* inR, float* outL, float* ou
     directLevel.target = wash ? 0.55f : 1.0f;
     revSend.target     = wash ? 0.95f : 0.22f;
     grainLevel.target  = wash ? 1.0f : 0.0f;
-    grainDry.target    = 1.0f - p.tonal * 0.85f;
-    resLevel.target    = p.tonal * 6.0f;
-    gRaw.target = (float) std::cos (p.tonal * kPi / 2);
-    gTon.target = (float) std::sin (p.tonal * kPi / 2) * 1.1f;
-    gNoi.target = p.noise * p.noise * 0.9f;
-    colour.target = p.color;
     dryMix.target = (float) std::cos (p.mix * kPi / 2);
     wetMix.target = (float) std::sin (p.mix * kPi / 2);
+    wAir.target  = p.noiseMode == 0 ? 1.0f : 0.0f;
+    wDust.target = p.noiseMode == 1 ? 1.0f : 0.0f;
+    wWind.target = p.noiseMode == 2 ? 1.0f : 0.0f;
     updateResonators (p.key);
 
-    const float msK  = (float) (1.0 - std::exp (-1.0 / (0.02 * sr)));
-    const float attK = (float) (1.0 - std::exp (-1.0 / (0.01 * sr)));
-    const float relK = (float) (1.0 - std::exp (-1.0 / (0.25 * sr)));
+    // Breath detector: Smooth follows the energy, Pump hits hard and lets go fast, Gate chops.
+    struct DetectorShape { double attack, release; float lowDb, highDb, curve; };
+    static const DetectorShape shapes[3] = { { 0.012, 0.40, -42.0f, -6.0f, 1.0f },
+                                             { 0.0015, 0.16, -44.0f, -18.0f, 0.5f },
+                                             { 0.0005, 0.045, -34.0f, -29.0f, 1.0f } };
+    const auto& det = shapes[std::clamp (p.breathMode, 0, 2)];
+    const float attK = (float) (1.0 - std::exp (-1.0 / (det.attack * sr)));
+    const float relK = (float) (1.0 - std::exp (-1.0 / (det.release * sr)));
     const double wobble = 1.0 + d * 0.25 * std::sin (driftPhase * 0.5);
+
+    // LFO
+    const int targets = p.lfoDepth > 0.0005f ? p.lfoTargets : 0;
+    const float depth = p.lfoDepth;
+    const double lfoInc = std::clamp (p.lfoHz, 0.001, 40.0) / sr;
+    if (p.lfoPhase >= 0.0)
+    {
+        double diff = p.lfoPhase - lfoPh;
+        diff -= std::floor (diff + 0.5);
+        if (std::abs (diff) > 0.02) lfoPh = p.lfoPhase; // jump after a relocate, otherwise stay continuous
+    }
+    const float lfoK = (float) (1.0 - std::exp (-1.0 / (0.0015 * sr)));
+
+    // wind sweep target (slow random walk)
+    windPhase += n / sr * 0.12;
+    if (windPhase >= 1.0) { windPhase -= 1.0; windTarget = nextRandom(); }
+    float maxDuck = 0.0f;
 
     const int64_t w0 = written.load (std::memory_order_relaxed);
     int ow = outWrite.load (std::memory_order_relaxed);
@@ -270,17 +310,47 @@ void Engine::process (const float* inL, const float* inR, float* outL, float* ou
         ringL[(size_t) a] = xl;
         ringR[(size_t) a] = xr;
 
-        // breath envelope
-        const float xm = 0.5f * (xl + xr);
-        envMs += (xm * xm - envMs) * msK;
-        const float rms = std::sqrt (envMs);
-        env += (rms - env) * (rms > env ? attK : relK);
-        duck.target = 1.0f - p.breath * 0.9f * std::min (1.0f, env * 5.0f);
+        // LFO
+        const double prevPh = lfoPh;
+        lfoPh += lfoInc;
+        if (lfoPh >= 1.0) lfoPh -= std::floor (lfoPh);
+        if (lfoPh < prevPh) { lfoRandPrev = lfoRandNext; lfoRandNext = nextRandom() * 2.0f - 1.0f; }
+        lfoSmooth += (lfoShapeValue (p.lfoShape, lfoPh) - lfoSmooth) * lfoK;
+        const float lfo = lfoSmooth;
+        auto modded = [&] (float base, int bit) { return (targets & bit) ? std::clamp (base + 0.5f * depth * lfo, 0.0f, 1.0f) : base; };
+        const float tonal = modded (p.tonal, kModTonal);
+        const float noise = modded (p.noise, kModNoise);
+        colour.target = modded (p.color, kModColor);
+        gRaw.target = (float) std::cos (tonal * kPi / 2);
+        gTon.target = (float) std::sin (tonal * kPi / 2) * 1.1f;
+        gNoi.target = noise * noise * 0.9f;
+        grainDry.target = 1.0f - tonal * 0.85f;
+        resLevel.target = tonal * 6.0f;
+        levelMod.target = (targets & kModLevel) ? 1.0f - depth * (0.5f - 0.5f * lfo) : 1.0f;
+        const float pan = (targets & kModPan) ? depth * lfo : 0.0f;
+        panL.target = std::min (1.0f, 1.0f - pan);
+        panR.target = std::min (1.0f, 1.0f + pan);
 
-        // colour filters (coefficients every 64 samples)
+        // breath detector (input or external sidechain)
+        const float key = p.sidechainL != nullptr ? 0.5f * (std::abs (p.sidechainL[i]) + std::abs (p.sidechainR[i]))
+                                                  : 0.5f * (std::abs (xl) + std::abs (xr));
+        detEnv += (key - detEnv) * (key > detEnv ? attK : relK);
+        const float db = 20.0f * std::log10 (detEnv + 1e-9f);
+        float amt = std::clamp ((db - det.lowDb) / (det.highDb - det.lowDb), 0.0f, 1.0f);
+        amt = amt * amt * (3.0f - 2.0f * amt);
+        if (det.curve < 1.0f) amt = std::sqrt (amt);
+        const float pull = p.breath * amt;
+        maxDuck = std::max (maxDuck, pull);
+        duck.target = 1.0f - pull;
+
+        // colour filters (coefficients every 32 samples)
         const float c = colour.next();
-        if ((filterCounter++ & 63) == 0)
+        if ((filterCounter++ & 31) == 0)
         {
+            windPos += (windTarget - windPos) * 0.004;
+            const double wc = 260.0 * std::pow (10.0, windPos * 1.05);
+            windBp[0][0].bandpass (sr, wc, 3.2);         windBp[0][1].bandpass (sr, wc * 2.3, 4.0);
+            windBp[1][0].bandpass (sr, wc * 1.18, 3.2);  windBp[1][1].bandpass (sr, wc * 2.6, 4.0);
             const double cut = 600.0 * std::pow (30.0, c) * wobble;
             for (int ch = 0; ch < 2; ++ch)
             {
@@ -294,10 +364,36 @@ void Engine::process (const float* inL, const float* inR, float* outL, float* ou
         float sg[kSnapshots];
         for (int k = 0; k < kSnapshots; ++k) sg[k] = snapGain[k].next();
         const float gr = gRaw.next(), gt = gTon.next(), gn = gNoi.next();
-        float L = 0, R = 0;
-        if (cur.set != nullptr) renderLayers (cur, std::sqrt (fade), sg, gr, gt, gn, tonRate, L, R);
-        if (prev.set != nullptr) renderLayers (prev, std::sqrt (1.0f - fade), sg, gr, gt, gn, tonRate, L, R);
+        float L = 0, R = 0, NL = 0, NR = 0;
+        if (cur.set != nullptr) renderLayers (cur, std::sqrt (fade), sg, gr, gt, gn, tonRate, L, R, NL, NR);
+        if (prev.set != nullptr) renderLayers (prev, std::sqrt (1.0f - fade), sg, gr, gt, gn, tonRate, L, R, NL, NR);
         fade = std::min (1.0f, fade + fadeStep);
+
+        // noise modes: Air as is, Dust crackles, Wind sweeps through resonant bands
+        {
+            const float wa = wAir.next(), wd = wDust.next(), ww = wWind.next();
+            float outNL = NL * wa, outNR = NR * wa;
+            if (wd > 0.0005f)
+            {
+                const float rate = (float) (38.0 / sr);
+                for (int ch = 0; ch < 2; ++ch)
+                {
+                    if (nextRandom() < rate) crackle[ch] = std::max (crackle[ch], 0.35f + 0.65f * nextRandom());
+                    crackle[ch] *= 0.9965f;
+                }
+                outNL += wd * NL * (0.1f + crackle[0] * 3.2f);
+                outNR += wd * NR * (0.1f + crackle[1] * 3.2f);
+            }
+            if (ww > 0.0005f)
+            {
+                const float bl = windBp[0][0].process (NL) + 0.6f * windBp[0][1].process (NL);
+                const float br = windBp[1][0].process (NR) + 0.6f * windBp[1][1].process (NR);
+                outNL += ww * (NL * 0.2f + bl * 2.6f);
+                outNR += ww * (NR * 0.2f + br * 2.6f);
+            }
+            L += outNL;
+            R += outNR;
+        }
 
         // grains
         if (wash)
@@ -359,9 +455,9 @@ void Engine::process (const float* inL, const float* inR, float* outL, float* ou
         float yl = padL * dl + vl, yr = padR * dl + vr;
         yl = lp[0].process (shelfHi[0].process (shelfLo[0].process (yl)));
         yr = lp[1].process (shelfHi[1].process (shelfLo[1].process (yr)));
-        const float dk = duck.next();
-        yl = std::tanh (yl * dk);
-        yr = std::tanh (yr * dk);
+        const float dk = duck.next() * levelMod.next();
+        yl = std::tanh (yl) * dk * panL.next();
+        yr = std::tanh (yr) * dk * panR.next();
 
         const float dm = dryMix.next(), wm = wetMix.next();
         const float ol = xl * dm + yl * wm, orr = xr * dm + yr * wm;
@@ -376,5 +472,7 @@ void Engine::process (const float* inL, const float* inR, float* outL, float* ou
     written.store (w0 + n, std::memory_order_release);
     outWrite.store (ow & (kOutRing - 1), std::memory_order_release);
     outputRms.store ((float) std::sqrt (vuSum / std::max (1, n)), std::memory_order_relaxed);
+    duckAmount.store (maxDuck, std::memory_order_relaxed);
+    lfoValue.store (lfoSmooth, std::memory_order_relaxed);
 }
 } // namespace bl

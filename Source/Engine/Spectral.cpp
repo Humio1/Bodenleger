@@ -95,6 +95,18 @@ std::vector<int> scaleNotes (Key k)
     return iv;
 }
 
+std::vector<int> maskNotes (Key k, int keyMode)
+{
+    if (keyMode != kChord) return scaleNotes (k);
+    const auto iv = scaleIntervals (k.scale);
+    std::vector<int> out;
+    if (iv.size() == 7)
+        for (int idx : { 0, 2, 4, 6 }) out.push_back ((k.root + iv[(size_t) idx]) % 12);
+    else
+        for (int i : iv) out.push_back ((k.root + i) % 12);
+    return out;
+}
+
 Spec spectrumOf (const float* x, int n)
 {
     const auto& win = hann();
@@ -245,11 +257,11 @@ Key detectKey (const std::array<Snapshot, kSnapshots>& snaps, double sampleRate)
     return best;
 }
 
-std::vector<float> buildMask (Key key, int fftSize, double sampleRate, float sigma)
+std::vector<float> buildMask (const std::vector<int>& notes, int fftSize, double sampleRate, float sigma)
 {
     bool inScale[12] = {};
-    for (int n : scaleNotes (key))
-        inScale[n] = true;
+    for (int n : notes)
+        inScale[((n % 12) + 12) % 12] = true;
 
     const int half = fftSize / 2;
     const double df = sampleRate / fftSize, s2 = 2.0 * sigma * sigma;
@@ -281,7 +293,7 @@ int synthSizeFor (double sampleRate)
     return sampleRate > 64000.0 ? (1 << 19) : (1 << 18);
 }
 
-StereoLoop synthesise (const Spec& S, const float* fine, int N, double sampleRate, std::mt19937& rng)
+StereoLoop synthesise (const Spec& S, const float* fine, int N, double sampleRate, std::mt19937& rng, float octaveUp)
 {
     std::vector<double> re ((size_t) N, 0.0), im ((size_t) N, 0.0);
     std::uniform_real_distribution<double> phase (0.0, kTwoPi);
@@ -297,6 +309,16 @@ StereoLoop synthesise (const Spec& S, const float* fine, int N, double sampleRat
         const int i0 = (int) x;
         const double fr = x - i0;
         double mag = S[(size_t) i0] * (1.0 - fr) + S[(size_t) std::min (kBins - 1, i0 + 1)] * fr;
+        if (octaveUp > 0.0f)
+        {
+            const double xh = x * 0.5;
+            const int h0 = (int) xh;
+            if (h0 >= 1)
+            {
+                const double hf = xh - h0;
+                mag += octaveUp * (S[(size_t) h0] * (1.0 - hf) + S[(size_t) std::min (kBins - 1, h0 + 1)] * hf);
+            }
+        }
         if (fine != nullptr) mag *= fine[j];
         if (f < 90.0) mag *= (f - 32.0) / 58.0;
         if (f > 12000.0) mag *= std::max (0.0, (top - f) / (top - 12000.0));

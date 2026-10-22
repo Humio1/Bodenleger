@@ -22,17 +22,47 @@ public:
     void paintButton (juce::Graphics&, bool highlighted, bool down) override;
 };
 
-/** A row of lamp buttons bound to a choice parameter. */
+/** A grid of lamp buttons bound to a choice parameter (one row by default). */
 class ChoiceSwitch : public juce::Component
 {
 public:
-    ChoiceSwitch (juce::RangedAudioParameter& param, const juce::StringArray& labels);
+    ChoiceSwitch (juce::RangedAudioParameter& param, const juce::StringArray& labels, int columns = 0);
     void paint (juce::Graphics&) override;
     void resized() override;
 
 private:
     juce::OwnedArray<LampButton> buttons;
     juce::ParameterAttachment attachment;
+    int columns = 0;
+};
+
+/** Chrome bat-handle toggle switch (Kippschalter) with 2 or 3 positions, labels to the right. */
+class ToggleSwitch : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    ToggleSwitch (juce::RangedAudioParameter& param, const juce::StringArray& labels);
+    void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+
+    /** Optional: draws a small lamp next to one position label (e.g. sidechain signal present). */
+    std::function<bool (int position)> lampFor;
+
+private:
+    int positionAt (float y) const;
+    void select (int index);
+    juce::Rectangle<float> leverArea() const;
+
+    juce::StringArray labels;
+    juce::ParameterAttachment attachment;
+    int current = 0;
+    float shown = 0.0f;
+};
+
+struct ModInfo
+{
+    float depth = 0.0f; // 0 = not modulated
+    float lfo = 0.0f;   // current LFO value, -1..1
 };
 
 /** Bakelite knob with engraved label, typewriter readout and hint. */
@@ -40,10 +70,22 @@ class Knob : public juce::Component
 {
 public:
     Knob (juce::AudioProcessorValueTreeState& state, const juce::String& paramId,
-          const juce::String& labelText, const juce::String& hintText);
+          const juce::String& labelText, const juce::String& hintText, int dialSize = 88);
     void paint (juce::Graphics&) override;
+    void paintOverChildren (juce::Graphics&) override;
     void resized() override;
 
+    /** Shows the LFO range as a ring around the dial. */
+    std::function<ModInfo()> modulation;
+    /** Shows a red lamp that glows with this value (0..1), e.g. how hard Breath is ducking. */
+    std::function<float()> meter;
+
+private:
+    int dialSize;
+    ModInfo lastMod;
+    float lastMeter = -1.0f;
+public:
+    void refreshIndicators();
 private:
     juce::Slider slider;
     juce::RangedAudioParameter* param;

@@ -19,11 +19,12 @@ public:
     /** Returns a result with set == nullptr when the sources are silent. */
     BuildResult build (const std::vector<SourceSpectra>& sources,
                        std::vector<std::pair<std::shared_ptr<const SampleData>, float>> grainSources,
-                       bool autoKey, Key manualKey, double sampleRate);
+                       bool autoKey, Key manualKey, int keyMode, double sampleRate);
 
 private:
     std::mt19937 rng { std::random_device{}() };
     Key maskKey { -1, -1 };
+    int maskMode = -1;
     int maskSize = 0;
     double maskRate = 0;
     std::vector<float> fineMask, noiseTilt, coarseMask;

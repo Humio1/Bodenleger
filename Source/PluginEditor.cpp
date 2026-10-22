@@ -4,20 +4,28 @@ using namespace bench;
 
 namespace
 {
-constexpr int kW = 1080, kH = 730, kEar = 34;
-constexpr int kHeaderH = 100, kBodyBottom = 530, kRackRight = 354;
+constexpr int kW = MainPanel::kW, kH = MainPanel::kH, kEar = 34;
+constexpr int kHeaderH = 100, kBodyBottom = 530, kRackRight = 354, kKnobBottom = 690, kCharRight = 532;
 const char* kNoteNames[] = { "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B" };
 const char* kScaleNames[] = { "minor", "major", "root + 5th" };
+const char* kKeyModes[] = { "scale", "chord", "shimmer" };
+const char* kNoiseModes[] = { "air", "dust", "wind" };
 } // namespace
 
-BodenlegerEditor::BodenlegerEditor (BodenlegerProcessor& p)
-    : AudioProcessorEditor (&p), proc (p),
+MainPanel::MainPanel (BodenlegerProcessor& p)
+    : proc (p),
       sourceSwitch (*p.apvts.getParameter (ids::source), { "Return", "Samples" }),
       modeSwitch (*p.apvts.getParameter (ids::mode), { "Drone", "Wash" }),
-      returnPanel (p), spectrum (p)
+      returnPanel (p), spectrum (p),
+      keyModeSwitch (*p.apvts.getParameter (ids::keyMode), { "Scale", "Chord", "Shimmer" }),
+      noiseModeSwitch (*p.apvts.getParameter (ids::noiseMode), { "Air", "Dust", "Wind" }),
+      breathModeSwitch (*p.apvts.getParameter (ids::breathMode), { "Smooth", "Pump", "Gate" }),
+      listenSwitch (*p.apvts.getParameter (ids::breathListen), { "Input", "Sidechain" }),
+      lfoShapes (*p.apvts.getParameter (ids::lfoShape), { "Sine", "Tri", "Square", "Random" }, 2),
+      rateKnob (p.apvts, ids::lfoRate, "Rate", {}, 62),
+      divisionKnob (p.apvts, ids::lfoDivision, "Rate", {}, 62),
+      depthKnob (p.apvts, ids::lfoDepth, "Depth", {}, 62)
 {
-    setLookAndFeel (&lnf);
-
     addAndMakeVisible (sourceSwitch);
     addAndMakeVisible (modeSwitch);
     addAndMakeVisible (vu);
@@ -60,26 +68,62 @@ BodenlegerEditor::BodenlegerEditor (BodenlegerProcessor& p)
         addAndMakeVisible (b);
     }
 
-    knobs.add (new Knob (p.apvts, ids::tonal,  "Tonal",  "Noise <> in key"));
-    knobs.add (new Knob (p.apvts, ids::noise,  "Noise",  "Air layer"));
+    auto* tonal  = knobs.add (new Knob (p.apvts, ids::tonal,  "Tonal",  "Noise <> in key"));
+    auto* noise  = knobs.add (new Knob (p.apvts, ids::noise,  "Noise",  "Noise layer"));
     knobs.add (new Knob (p.apvts, ids::drift,  "Drift",  "Slow movement"));
-    knobs.add (new Knob (p.apvts, ids::color,  "Color",  "Dark <> bright"));
-    knobs.add (new Knob (p.apvts, ids::breath, "Breath", "Ducks with the return"));
+    auto* color  = knobs.add (new Knob (p.apvts, ids::color,  "Color",  "Dark <> bright"));
+    auto* breath = knobs.add (new Knob (p.apvts, ids::breath, "Breath", "Sidechain depth"));
     knobs.add (new Knob (p.apvts, ids::mix,    "Mix",    "Dry <> pad"));
     for (auto* k : knobs) addAndMakeVisible (k);
+    tonal->modulation = [this] { return modFor (ids::modTonal); };
+    noise->modulation = [this] { return modFor (ids::modNoise); };
+    color->modulation = [this] { return modFor (ids::modColor); };
+    breath->meter = [this] { return proc.engine.duckAmount.load(); };
+
+    // character
+    for (auto* t : { &keyModeSwitch, &noiseModeSwitch, &breathModeSwitch, &listenSwitch })
+        addAndMakeVisible (t);
+    listenSwitch.lampFor = [this] (int pos) { return pos == 1 && proc.isSidechainActive(); };
+    keyModeSwitch.setTooltip ("How the pad is pulled into key: all scale notes, only chord tones, or scale plus an octave-up shimmer");
+    noiseModeSwitch.setTooltip ("Character of the noise layer: smooth air, vinyl-like dust, or sweeping wind");
+    breathModeSwitch.setTooltip ("How Breath reacts: Smooth follows the energy, Pump hits hard and lets go fast, Gate chops");
+    listenSwitch.setTooltip ("What Breath listens to: the plugin's input, or the sidechain input (route a kick to it in your DAW)");
+
+    // modulation
+    addAndMakeVisible (lfoShapes);
+    lfoSync.setClickingTogglesState (true);
+    syncAtt = std::make_unique<juce::ButtonParameterAttachment> (*p.apvts.getParameter (ids::lfoSync), lfoSync);
+    addAndMakeVisible (lfoSync);
+    addAndMakeVisible (rateKnob);
+    addChildComponent (divisionKnob);
+    addAndMakeVisible (depthKnob);
+    const std::pair<const char*, const char*> targetDefs[] = { { ids::modColor, "Color" }, { ids::modTonal, "Tonal" },
+                                                                { ids::modNoise, "Noise" }, { ids::modLevel, "Level" },
+                                                                { ids::modPan, "Pan" } };
+    for (auto& [id, name] : targetDefs)
+    {
+        auto* b = targets.add (new LampButton (name));
+        b->setClickingTogglesState (true);
+        targetAtts.add (new juce::ButtonParameterAttachment (*p.apvts.getParameter (id), *b));
+        addAndMakeVisible (b);
+    }
 
     setSize (kW, kH);
     timerCallback();
     startTimerHz (30);
 }
 
-BodenlegerEditor::~BodenlegerEditor()
+MainPanel::~MainPanel()
 {
     stopTimer();
-    setLookAndFeel (nullptr);
 }
 
-void BodenlegerEditor::setParam (const char* id, float v)
+ModInfo MainPanel::modFor (const char* targetId) const
+{
+    return { proc.getLfoDepthFor (targetId), proc.engine.lfoValue.load() };
+}
+
+void MainPanel::setParam (const char* id, float v)
 {
     if (auto* prm = proc.apvts.getParameter (id))
     {
@@ -89,14 +133,14 @@ void BodenlegerEditor::setParam (const char* id, float v)
     }
 }
 
-void BodenlegerEditor::chooseKey (int root, int scale)
+void MainPanel::chooseKey (int root, int scale)
 {
     setParam (ids::keyAuto, 0.0f);
     setParam (ids::keyRoot, (float) root);
     setParam (ids::keyScale, (float) juce::jlimit (0, 2, scale));
 }
 
-juce::String BodenlegerEditor::statusText() const
+juce::String MainPanel::statusText() const
 {
     juce::String src;
     if (proc.getSourceMode() == 1)
@@ -112,13 +156,13 @@ juce::String BodenlegerEditor::statusText() const
     const auto k = proc.getEffectiveKey();
     const bool autoOn = proc.apvts.getRawParameterValue (ids::keyAuto)->load() > 0.5f;
     const bool wash = proc.apvts.getRawParameterValue (ids::mode)->load() > 0.5f;
-    const double sr = proc.engine.getSampleRate();
+    const int noiseMode = juce::jlimit (0, 2, (int) proc.apvts.getRawParameterValue (ids::noiseMode)->load());
     return src + "  /  " + kNoteNames[k.root] + " " + kScaleNames[k.scale] + (autoOn ? " (auto)" : "")
-         + "  /  " + (wash ? "wash" : "drone")
-         + "  /  3 snapshots, " + juce::String (bl::synthSizeFor (sr) / sr, 1) + " s loops";
+         + ", " + kKeyModes[juce::jlimit (0, 2, proc.getKeyMode())]
+         + "  /  " + (wash ? "wash" : "drone") + ", " + kNoiseModes[noiseMode] + " noise";
 }
 
-void BodenlegerEditor::timerCallback()
+void MainPanel::timerCallback()
 {
     ++tick;
     vu.setLevel (proc.engine.outputRms.load());
@@ -140,7 +184,7 @@ void BodenlegerEditor::timerCallback()
     const auto k = proc.getEffectiveKey();
     if (scaleBox.getSelectedId() != k.scale + 1)
         scaleBox.setSelectedId (k.scale + 1, juce::dontSendNotification);
-    const auto notes = bl::scaleNotes (k);
+    const auto notes = bl::maskNotes (k, proc.getKeyMode());
     for (int i = 0; i < 12; ++i)
         keys[i]->setState (std::find (notes.begin(), notes.end(), i) != notes.end(), i == k.root);
 
@@ -149,9 +193,17 @@ void BodenlegerEditor::timerCallback()
 
     const auto st = statusText();
     if (st != shownStatus) { shownStatus = st; repaint (statusArea); }
+
+    // modulation and breath indicators
+    for (auto* kn : knobs) kn->refreshIndicators();
+    const bool synced = proc.apvts.getRawParameterValue (ids::lfoSync)->load() > 0.5f;
+    if (divisionKnob.isVisible() != synced) { divisionKnob.setVisible (synced); rateKnob.setVisible (! synced); }
+    const float lfo = proc.isAudioRunning() ? proc.engine.lfoValue.load() : 0.0f;
+    if (std::abs (lfo - shownLfo) > 0.02f) { shownLfo = lfo; repaint (lfoLampArea.expanded (6)); }
+    if ((tick % 6) == 0) listenSwitch.repaint();
 }
 
-void BodenlegerEditor::resized()
+void MainPanel::resized()
 {
     sourceSwitch.setBounds (486, 46, 196, 36);
     modeSwitch.setBounds (700, 46, 170, 36);
@@ -179,9 +231,25 @@ void BodenlegerEditor::resized()
     const int kr = kBodyBottom + 14, knobW = (kW - 2 * kEar) / knobs.size();
     for (int i = 0; i < knobs.size(); ++i)
         knobs[i]->setBounds (kEar + i * knobW, kr, knobW, 146);
+
+    // character switches
+    keyModeSwitch.setBounds (54, 746, 110, 92);
+    noiseModeSwitch.setBounds (168, 746, 106, 92);
+    breathModeSwitch.setBounds (278, 746, 110, 92);
+    listenSwitch.setBounds (392, 746, 132, 92);
+
+    // modulation
+    lfoLampArea = { 690, 706, 11, 11 };
+    lfoShapes.setBounds (552, 730, 182, 66);
+    lfoSync.setBounds (552, 802, 182, 30);
+    rateKnob.setBounds (742, 724, 92, 112);
+    divisionKnob.setBounds (742, 724, 92, 112);
+    depthKnob.setBounds (836, 724, 92, 112);
+    for (int i = 0; i < targets.size(); ++i)
+        targets[i]->setBounds (942, 726 + i * 25, 96, 22);
 }
 
-void BodenlegerEditor::paint (juce::Graphics& g)
+void MainPanel::paint (juce::Graphics& g)
 {
     g.fillAll (col::page);
 
@@ -223,6 +291,8 @@ void BodenlegerEditor::paint (juce::Graphics& g)
     groove (kEar, kHeaderH, kW - kEar, kHeaderH);
     groove (kRackRight, kHeaderH, kRackRight, kBodyBottom);
     groove (kEar, kBodyBottom, kW - kEar, kBodyBottom);
+    groove (kEar, kKnobBottom, kW - kEar, kKnobBottom);
+    groove (kCharRight, kKnobBottom, kCharRight, kH - 34);
 
     // nameplate
     const auto plate = juce::Rectangle<float> (56, 20, 232, 60);
@@ -289,11 +359,65 @@ void BodenlegerEditor::paint (juce::Graphics& g)
     chip (juce::Colour::fromRGB (90, 95, 80), "Noise");
     chip (juce::Colour::fromRGB (120, 20, 5), "Output (live)");
 
+    // character
+    drawEngraved (g, "CHARACTER", { 54, 698, 200, 26 }, label (16.0f, 0.26f), juce::Justification::centredLeft, col::ink);
+    const char* charTitles[] = { "IN KEY", "NOISE", "BREATH", "LISTEN" };
+    const ToggleSwitch* charSwitches[] = { &keyModeSwitch, &noiseModeSwitch, &breathModeSwitch, &listenSwitch };
+    for (int i = 0; i < 4; ++i)
+        drawEngraved (g, charTitles[i], charSwitches[i]->getBounds().toFloat().withY (724).withHeight (18),
+                      label (12.5f, 0.2f), juce::Justification::centredLeft);
+
+    // modulation
+    drawEngraved (g, "MODULATION", { 552, 698, 200, 26 }, label (16.0f, 0.26f), juce::Justification::centredLeft, col::ink);
+    {
+        const auto lamp = lfoLampArea.toFloat();
+        const float v = 0.5f + 0.5f * shownLfo;
+        g.setColour (col::lampOn.withAlpha (0.35f * v));
+        g.fillEllipse (lamp.expanded (4 * v));
+        g.setColour (col::lampOff.interpolatedWith (col::lampOn, v));
+        g.fillEllipse (lamp);
+        g.setColour (juce::Colours::black.withAlpha (0.4f));
+        g.drawEllipse (lamp, 0.8f);
+    }
+    drawEngraved (g, "SEND TO", { (float) targets[0]->getX(), 698, 120, 26 }, label (12.5f, 0.2f), juce::Justification::centredLeft);
+
     // footer
     g.setFont (typewriter (13.0f));
     g.setColour (col::ink3);
     g.drawText ("Bodenleger was Offergeld's idea: a floor laid under the track from its own leftovers.",
-                juce::Rectangle<float> ((float) kEar + 20, (float) kH - 28, 700, 22), juce::Justification::centredLeft, false);
+                juce::Rectangle<float> ((float) kEar + 20, (float) kH - 28, 640, 22), juce::Justification::centredLeft, false);
     g.drawText ("v" + juce::String (JucePlugin_VersionString),
                 juce::Rectangle<float> ((float) kW - kEar - 120, (float) kH - 28, 100, 22), juce::Justification::centredRight, false);
+}
+
+//==============================================================================
+BodenlegerEditor::BodenlegerEditor (BodenlegerProcessor& p)
+    : AudioProcessorEditor (&p), proc (p), panel (p)
+{
+    setLookAndFeel (&lnf);
+    addAndMakeVisible (panel);
+
+    const double scale = juce::jlimit (0.6, 1.6, (double) p.apvts.state.getProperty ("uiScale", 0.88));
+    setResizable (true, true);
+    setResizeLimits ((int) (kW * 0.6), (int) (kH * 0.6), (int) (kW * 1.6), (int) (kH * 1.6));
+    if (auto* c = getConstrainer()) c->setFixedAspectRatio ((double) kW / kH);
+    setSize (juce::roundToInt (kW * scale), juce::roundToInt (kH * scale));
+}
+
+BodenlegerEditor::~BodenlegerEditor()
+{
+    setLookAndFeel (nullptr);
+}
+
+void BodenlegerEditor::paint (juce::Graphics& g)
+{
+    g.fillAll (col::page);
+}
+
+void BodenlegerEditor::resized()
+{
+    const float scale = (float) getWidth() / (float) kW;
+    panel.setBounds (0, 0, kW, kH);
+    panel.setTransform (juce::AffineTransform::scale (scale));
+    proc.apvts.state.setProperty ("uiScale", scale, nullptr);
 }

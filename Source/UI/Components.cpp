@@ -56,13 +56,14 @@ void MiniButton::paintButton (juce::Graphics& g, bool highlighted, bool down)
 }
 
 //==============================================================================
-ChoiceSwitch::ChoiceSwitch (juce::RangedAudioParameter& param, const juce::StringArray& labels)
+ChoiceSwitch::ChoiceSwitch (juce::RangedAudioParameter& param, const juce::StringArray& labels, int cols)
     : attachment (param, [this] (float v)
       {
           const int idx = juce::roundToInt (v);
           for (int i = 0; i < buttons.size(); ++i)
               buttons[i]->setToggleState (i == idx, juce::dontSendNotification);
-      })
+      }),
+      columns (cols)
 {
     for (int i = 0; i < labels.size(); ++i)
     {
@@ -84,20 +85,143 @@ void ChoiceSwitch::paint (juce::Graphics& g)
 
 void ChoiceSwitch::resized()
 {
-    auto r = getLocalBounds().reduced (4);
+    const auto r = getLocalBounds().reduced (4);
     const int gap = 4, n = buttons.size();
-    const int w = (r.getWidth() - gap * (n - 1)) / juce::jmax (1, n);
+    const int cols = columns > 0 ? columns : n;
+    const int rows = (n + cols - 1) / juce::jmax (1, cols);
+    const int w = (r.getWidth() - gap * (cols - 1)) / juce::jmax (1, cols);
+    const int h = (r.getHeight() - gap * (rows - 1)) / juce::jmax (1, rows);
     for (int i = 0; i < n; ++i)
     {
-        buttons[i]->setBounds (r.removeFromLeft (i == n - 1 ? r.getWidth() : w).withTrimmedBottom (1));
-        r.removeFromLeft (gap);
+        const int c = i % cols, row = i / cols;
+        const int x = r.getX() + c * (w + gap), y = r.getY() + row * (h + gap);
+        const int bw = c == cols - 1 ? r.getRight() - x : w;
+        buttons[i]->setBounds (x, y, bw, h - (row == rows - 1 ? 1 : 0));
+    }
+}
+
+//==============================================================================
+ToggleSwitch::ToggleSwitch (juce::RangedAudioParameter& param, const juce::StringArray& l)
+    : labels (l),
+      attachment (param, [this] (float v)
+      {
+          current = juce::jlimit (0, labels.size() - 1, juce::roundToInt (v));
+          repaint();
+      })
+{
+    setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    setTitle (param.getName (64));
+    attachment.sendInitialUpdate();
+}
+
+juce::Rectangle<float> ToggleSwitch::leverArea() const
+{
+    return getLocalBounds().toFloat().removeFromLeft (38.0f);
+}
+
+int ToggleSwitch::positionAt (float y) const
+{
+    const int n = labels.size();
+    return juce::jlimit (0, n - 1, (int) (y / (float) getHeight() * (float) n));
+}
+
+void ToggleSwitch::select (int index)
+{
+    if (index != current)
+        attachment.setValueAsCompleteGesture ((float) index);
+}
+
+void ToggleSwitch::mouseDown (const juce::MouseEvent& e) { select (positionAt ((float) e.y)); }
+void ToggleSwitch::mouseDrag (const juce::MouseEvent& e) { select (positionAt ((float) e.y)); }
+
+void ToggleSwitch::paint (juce::Graphics& g)
+{
+    const int n = labels.size();
+    const auto lever = leverArea();
+    const float rowH = (float) getHeight() / (float) n;
+    const juce::Point<float> c (lever.getCentreX(), (float) getHeight() * 0.5f);
+
+    // engraved position marks
+    for (int i = 0; i < n; ++i)
+    {
+        const float y = rowH * ((float) i + 0.5f);
+        g.setColour (juce::Colours::white.withAlpha (0.5f));
+        g.drawLine (lever.getRight() - 6, y + 1, lever.getRight() + 2, y + 1, 1.0f);
+        g.setColour (col::engrave);
+        g.drawLine (lever.getRight() - 6, y, lever.getRight() + 2, y, 1.0f);
+    }
+
+    // hex nut
+    juce::Path hex;
+    const float hr = 14.0f;
+    for (int k = 0; k < 6; ++k)
+    {
+        const float a = juce::MathConstants<float>::pi / 3.0f * (float) k + juce::MathConstants<float>::pi / 6.0f;
+        const juce::Point<float> pt (c.x + std::cos (a) * hr, c.y + std::sin (a) * hr);
+        if (k == 0) hex.startNewSubPath (pt); else hex.lineTo (pt);
+    }
+    hex.closeSubPath();
+    g.setColour (juce::Colours::black.withAlpha (0.3f));
+    g.fillPath (hex, juce::AffineTransform::translation (0, 2));
+    juce::ColourGradient nut (juce::Colour (0xffe9e4da), c.x - hr, c.y - hr, juce::Colour (0xff7a7368), c.x + hr, c.y + hr, false);
+    nut.addColour (0.5, juce::Colour (0xffb8b1a4));
+    g.setGradientFill (nut);
+    g.fillPath (hex);
+    g.setColour (juce::Colour (0xff4a453f));
+    g.strokePath (hex, juce::PathStrokeType (1.0f));
+    g.setColour (juce::Colour (0xff2a2622));
+    g.fillEllipse (c.x - 7.5f, c.y - 7.5f, 15, 15);
+
+    // lever: up, centre (pointing at you) or down
+    const float t = n == 2 ? (current == 0 ? -1.0f : 1.0f) : (float) (current - 1);
+    const float reach = juce::jmin (26.0f, (float) getHeight() * 0.5f - 7.0f);
+    const juce::Point<float> tip (c.x, c.y + t * reach);
+    if (std::abs (t) > 0.01f)
+    {
+        juce::Path bat;
+        const float w0 = 3.2f, w1 = 4.6f;
+        bat.startNewSubPath (c.x - w0, c.y);
+        bat.lineTo (tip.x - w1, tip.y);
+        bat.lineTo (tip.x + w1, tip.y);
+        bat.lineTo (c.x + w0, c.y);
+        bat.closeSubPath();
+        g.setColour (juce::Colours::black.withAlpha (0.3f));
+        g.fillPath (bat, juce::AffineTransform::translation (2, 2));
+        juce::ColourGradient chrome (juce::Colour (0xff8d877c), c.x - w1, 0, juce::Colour (0xff6c665c), c.x + w1, 0, false);
+        chrome.addColour (0.35, juce::Colours::white);
+        g.setGradientFill (chrome);
+        g.fillPath (bat);
+    }
+    const float ball = std::abs (t) > 0.01f ? 5.6f : 7.0f;
+    g.setColour (juce::Colours::black.withAlpha (0.3f));
+    g.fillEllipse (tip.x - ball + 1.5f, tip.y - ball + 2.0f, ball * 2, ball * 2);
+    juce::ColourGradient ballGrad (juce::Colours::white, tip.x - ball * 0.4f, tip.y - ball * 0.5f,
+                                   juce::Colour (0xff6c665c), tip.x + ball, tip.y + ball, true);
+    g.setGradientFill (ballGrad);
+    g.fillEllipse (tip.x - ball, tip.y - ball, ball * 2, ball * 2);
+
+    // labels
+    for (int i = 0; i < n; ++i)
+    {
+        auto row = juce::Rectangle<float> (lever.getRight() + 8, rowH * (float) i, (float) getWidth() - lever.getRight() - 8, rowH);
+        const bool on = i == current;
+        if (lampFor && lampFor (i))
+        {
+            const auto lamp = row.removeFromRight (12).withSizeKeepingCentre (7, 7);
+            g.setColour (col::lampOn.withAlpha (0.35f));
+            g.fillEllipse (lamp.expanded (3));
+            g.setColour (col::lampOn);
+            g.fillEllipse (lamp);
+        }
+        if (on) drawEngraved (g, labels[i].toUpperCase(), row, bench::label (14.5f, 0.14f), juce::Justification::centredLeft, col::ink);
+        else    drawEngraved (g, labels[i].toUpperCase(), row, bench::label (14.5f, 0.14f), juce::Justification::centredLeft, col::ink3.withAlpha (0.8f));
     }
 }
 
 //==============================================================================
 Knob::Knob (juce::AudioProcessorValueTreeState& state, const juce::String& paramId,
-            const juce::String& labelText, const juce::String& hintText)
-    : param (state.getParameter (paramId)), label (labelText), hint (hintText)
+            const juce::String& labelText, const juce::String& hintText, int size)
+    : param (state.getParameter (paramId)), label (labelText), hint (hintText), dialSize (size)
 {
     slider.setSliderStyle (juce::Slider::RotaryVerticalDrag);
     slider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
@@ -111,18 +235,80 @@ Knob::Knob (juce::AudioProcessorValueTreeState& state, const juce::String& param
 
 void Knob::resized()
 {
-    const int size = juce::jmin (getWidth(), 88);
+    const int size = juce::jmin (getWidth(), dialSize);
     slider.setBounds ((getWidth() - size) / 2, 0, size, size);
 }
 
 void Knob::paint (juce::Graphics& g)
 {
+    const bool small = dialSize < 80;
     auto r = getLocalBounds().toFloat().withTrimmedTop ((float) slider.getBottom() + 2);
-    drawEngraved (g, label.toUpperCase(), r.removeFromTop (22), bench::label (17.0f, 0.2f), juce::Justification::centred, col::ink);
-    g.setFont (typewriter (15.0f));
+    const auto labelRow = r.removeFromTop (small ? 18.0f : 22.0f);
+    const auto labelFont = bench::label (small ? 14.0f : 17.0f, 0.2f);
+    drawEngraved (g, label.toUpperCase(), labelRow, labelFont, juce::Justification::centred, col::ink);
+
+    if (meter)
+    {
+        const float w = juce::GlyphArrangement::getStringWidth (labelFont, label.toUpperCase());
+        const auto lamp = juce::Rectangle<float> (labelRow.getCentreX() + w * 0.5f + 8, labelRow.getCentreY() - 4, 8, 8);
+        const float v = juce::jlimit (0.0f, 1.0f, lastMeter);
+        if (v > 0.02f)
+        {
+            g.setColour (col::lampOn.withAlpha (0.4f * v));
+            g.fillEllipse (lamp.expanded (4 * v));
+        }
+        g.setColour (col::lampOff.interpolatedWith (col::lampOn, v));
+        g.fillEllipse (lamp);
+        g.setColour (juce::Colours::black.withAlpha (0.4f));
+        g.drawEllipse (lamp, 0.8f);
+    }
+
+    g.setFont (typewriter (small ? 14.0f : 15.0f));
     g.setColour (col::accent);
     g.drawText (param->getCurrentValueAsText(), r.removeFromTop (18), juce::Justification::centred, false);
-    drawEngraved (g, hint, r.removeFromTop (16), bench::label (12.5f, 0.06f), juce::Justification::centred);
+    if (hint.isNotEmpty())
+        drawEngraved (g, hint, r.removeFromTop (16), bench::label (12.5f, 0.06f), juce::Justification::centred);
+}
+
+void Knob::paintOverChildren (juce::Graphics& g)
+{
+    if (lastMod.depth <= 0.0005f) return;
+    const auto b = slider.getBounds().toFloat();
+    const auto c = b.getCentre();
+    const float R = (juce::jmin (b.getWidth(), b.getHeight()) * 0.5f - 2.0f) * 0.81f;
+    const float a0 = juce::MathConstants<float>::pi * 1.25f, a1 = juce::MathConstants<float>::pi * 2.75f;
+    const float v = (float) param->getValue();
+    const float lo = juce::jlimit (0.0f, 1.0f, v - 0.5f * lastMod.depth);
+    const float hi = juce::jlimit (0.0f, 1.0f, v + 0.5f * lastMod.depth);
+    juce::Path arc;
+    arc.addCentredArc (c.x, c.y, R, R, 0, a0 + lo * (a1 - a0), a0 + hi * (a1 - a0), true);
+    g.setColour (col::accent.withAlpha (0.85f));
+    g.strokePath (arc, juce::PathStrokeType (2.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    const float now = juce::jlimit (0.0f, 1.0f, v + 0.5f * lastMod.depth * lastMod.lfo);
+    const float a = a0 + now * (a1 - a0);
+    const juce::Point<float> dot (c.x + std::sin (a) * R, c.y - std::cos (a) * R);
+    g.setColour (col::lit);
+    g.fillEllipse (dot.x - 3.2f, dot.y - 3.2f, 6.4f, 6.4f);
+    g.setColour (col::accent);
+    g.drawEllipse (dot.x - 3.2f, dot.y - 3.2f, 6.4f, 6.4f, 1.2f);
+}
+
+void Knob::refreshIndicators()
+{
+    if (modulation)
+    {
+        const auto m = modulation();
+        if (std::abs (m.depth - lastMod.depth) > 0.001f || (m.depth > 0.0005f && std::abs (m.lfo - lastMod.lfo) > 0.01f))
+        {
+            lastMod = m;
+            repaint();
+        }
+    }
+    if (meter)
+    {
+        const float v = meter();
+        if (std::abs (v - lastMeter) > 0.02f) { lastMeter = v; repaint(); }
+    }
 }
 
 //==============================================================================
@@ -454,7 +640,7 @@ void SpectrumView::paint (juce::Graphics& g)
     auto xOf = [&] (float f) { return std::log (f / fmin) / std::log (fmax / fmin) * W; };
 
     const auto key = proc.getEffectiveKey();
-    const auto notes = bl::scaleNotes (key);
+    const auto notes = bl::maskNotes (key, proc.getKeyMode());
     g.setFont (typewriter (12.0f));
     for (int m = 28; m <= 118; ++m)
     {

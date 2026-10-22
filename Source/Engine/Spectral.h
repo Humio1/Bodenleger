@@ -31,6 +31,10 @@ struct Key
 std::vector<int> scaleIntervals (int scale);
 std::vector<int> scaleNotes (Key k);
 
+/** In-key modes: 0 = Scale (all scale notes), 1 = Chord (root, 3rd, 5th, 7th), 2 = Shimmer (scale + octave-up copy). */
+enum KeyMode { kScale = 0, kChord = 1, kShimmer = 2 };
+std::vector<int> maskNotes (Key k, int keyMode);
+
 /** Average magnitude spectrum of a block of mono audio (up to 40 analysis frames). */
 Spec spectrumOf (const float* x, int n);
 
@@ -59,7 +63,7 @@ float snapshotEnergy (const std::array<Snapshot, kSnapshots>& snaps);
 Key detectKey (const std::array<Snapshot, kSnapshots>& snaps, double sampleRate);
 
 /** Gaussian weight around the nearest scale note, one value per bin of an FFT of size fftSize. */
-std::vector<float> buildMask (Key key, int fftSize, double sampleRate, float sigmaSemitones);
+std::vector<float> buildMask (const std::vector<int>& notes, int fftSize, double sampleRate, float sigmaSemitones);
 std::vector<float> buildNoiseTilt (int fftSize, double sampleRate);
 
 struct StereoLoop
@@ -68,8 +72,9 @@ struct StereoLoop
 };
 
 /** Resynthesise a spectrum into a seamless loop of length synthSize (power of two). */
+/** octaveUp > 0 adds a copy of the spectrum shifted up one octave (shimmer). */
 StereoLoop synthesise (const Spec& spectrum, const float* fineWeights, int synthSize,
-                       double sampleRate, std::mt19937& rng);
+                       double sampleRate, std::mt19937& rng, float octaveUp = 0.0f);
 
 int synthSizeFor (double sampleRate);
 } // namespace bl
